@@ -245,7 +245,7 @@ def train_student(
         depth=12,
         rank=16,
         out_chans=256,
-        use_checkpoint=True,
+        use_checkpoint=False,
     )
     student.load_sam_stem_and_neck(str(sam_ckpt), freeze_stem_neck=(warmup_freeze_epochs > 0))
     student = student.to(device)

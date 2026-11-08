@@ -1,1 +1,4 @@
 venv/
+checkpoints_gr_sam/
+__pycache__/
+data/
