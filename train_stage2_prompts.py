@@ -124,6 +124,49 @@ def soft_dice_loss(student_logits: torch.Tensor, teacher_probs: torch.Tensor, ep
     dice = (2.0 * intersection + eps) / (denominator + eps)
     return (1.0 - dice).mean()
 
+def _decode_prompts_for_single_image(
+    img_emb_1: torch.Tensor,
+    dense_pe: torch.Tensor,
+    prompt_encoder: nn.Module,
+    mask_decoder: nn.Module,
+    prompts: Dict[str, torch.Tensor],
+    b_idx: int,
+    coarse_mask_input: torch.Tensor = None,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    n_single, n_pair, n_box, n_combo = prompts["counts"]
+
+    s1, e1 = b_idx * n_single, (b_idx + 1) * n_single
+    s2, e2 = b_idx * n_pair, (b_idx + 1) * n_pair
+    s3, e3 = b_idx * n_box, (b_idx + 1) * n_box
+    s4, e4 = b_idx * n_combo, (b_idx + 1) * n_combo
+
+    # Mode 1: Single Positive Point (multimask_output=True)
+    sp1, dn1 = prompt_encoder(points=(prompts["single_pts"][s1:e1], prompts["single_lbls"][s1:e1]), boxes=None, masks=None)
+    m1, iou1 = mask_decoder(image_embeddings=img_emb_1, image_pe=dense_pe, sparse_prompt_embeddings=sp1, dense_prompt_embeddings=dn1, multimask_output=True)
+    m1 = m1.reshape(-1, 1, 256, 256)
+    iou1 = iou1.reshape(-1, 1)
+
+    # Mode 2: Positive + Negative Points
+    sp2, dn2 = prompt_encoder(points=(prompts["pos_neg_pts"][s2:e2], prompts["pos_neg_lbls"][s2:e2]), boxes=None, masks=None)
+    m2, iou2 = mask_decoder(image_embeddings=img_emb_1, image_pe=dense_pe, sparse_prompt_embeddings=sp2, dense_prompt_embeddings=dn2, multimask_output=False)
+
+    # Mode 3: Standalone Box Only
+    sp3, dn3 = prompt_encoder(points=None, boxes=prompts["boxes_only"][s3:e3], masks=None)
+    m3, iou3 = mask_decoder(image_embeddings=img_emb_1, image_pe=dense_pe, sparse_prompt_embeddings=sp3, dense_prompt_embeddings=dn3, multimask_output=False)
+
+    # Mode 4: Combined Box + Points
+    sp4, dn4 = prompt_encoder(points=(prompts["combo_pts"][s4:e4], prompts["combo_lbls"][s4:e4]), boxes=prompts["combo_boxes"][s4:e4], masks=None)
+    m4, iou4 = mask_decoder(image_embeddings=img_emb_1, image_pe=dense_pe, sparse_prompt_embeddings=sp4, dense_prompt_embeddings=dn4, multimask_output=False)
+
+    # Mode 5: Iterative Dense Mask Refinement
+    mask_in = m2.detach() if coarse_mask_input is None else coarse_mask_input[s2:e2]
+    sp5, dn5 = prompt_encoder(points=(prompts["pos_neg_pts"][s2:e2], prompts["pos_neg_lbls"][s2:e2]), boxes=None, masks=mask_in)
+    m5, iou5 = mask_decoder(image_embeddings=img_emb_1, image_pe=dense_pe, sparse_prompt_embeddings=sp5, dense_prompt_embeddings=dn5, multimask_output=False)
+
+    all_masks = torch.cat([m1, m2, m3, m4, m5], dim=0)
+    all_ious = torch.cat([iou1, iou2, iou3, iou4, iou5], dim=0)
+    return all_masks, all_ious, m2.detach()
+
 
 def run_all_prompt_modalities(
     img_emb: torch.Tensor,
@@ -132,88 +175,25 @@ def run_all_prompt_modalities(
     prompts: Dict[str, torch.Tensor],
     coarse_mask_input: torch.Tensor = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """
-    Executes all 5 SAM prompt combinations through the frozen PromptEncoder and MaskDecoder:
-      Mode 1: Single positive point (with `multimask_output=True` to align all 3 ambiguity mask heads!)
-      Mode 2: Multi-point (Positive + Negative points, `multimask_output=False`)
-      Mode 3: Box only (`multimask_output=False`)
-      Mode 4: Box + Positive/Negative Point combination (`multimask_output=False`)
-      Mode 5: Iterative Dense Mask Prompt + Positive/Negative Points (`masks=coarse_mask_input`)
-    Returns:
-      all_masks: (Total_Queries, 1, 256, 256)
-      all_ious:  (Total_Queries, 1)
-      coarse_masks_for_refinement: detached (N2, 1, 256, 256) logits from Mode 2
-    """
     dense_pe = prompt_encoder.get_dense_pe()
-    n_single, n_pair, n_box, n_combo = prompts["counts"]
+    B = img_emb.shape[0]
 
-    # --- Mode 1: Single Foreground Point (multimask_output=True -> 3 masks per query) ---
-    sp1, dn1 = prompt_encoder(points=(prompts["single_pts"], prompts["single_lbls"]), boxes=None, masks=None)
-    m1, iou1 = mask_decoder(
-        image_embeddings=img_emb.repeat_interleave(n_single, dim=0),
-        image_pe=dense_pe,
-        sparse_prompt_embeddings=sp1,
-        dense_prompt_embeddings=dn1,
-        multimask_output=True,  # Aligns all 3 hierarchical ambiguity tokens!
-    )
-    # Reshape (N1, 3, 256, 256) -> (N1 * 3, 1, 256, 256)
-    m1 = m1.reshape(-1, 1, 256, 256)
-    iou1 = iou1.reshape(-1, 1)
+    masks_list, ious_list, coarse_list = [], [], []
+    for b in range(B):
+        m_b, iou_b, c_b = _decode_prompts_for_single_image(
+            img_emb_1=img_emb[b : b + 1],
+            dense_pe=dense_pe,
+            prompt_encoder=prompt_encoder,
+            mask_decoder=mask_decoder,
+            prompts=prompts,
+            b_idx=b,
+            coarse_mask_input=coarse_mask_input,
+        )
+        masks_list.append(m_b)
+        ious_list.append(iou_b)
+        coarse_list.append(c_b)
 
-    # --- Mode 2: Positive + Negative Points (multimask_output=False) ---
-    sp2, dn2 = prompt_encoder(points=(prompts["pos_neg_pts"], prompts["pos_neg_lbls"]), boxes=None, masks=None)
-    emb_pair = img_emb.repeat_interleave(n_pair, dim=0)
-    m2, iou2 = mask_decoder(
-        image_embeddings=emb_pair,
-        image_pe=dense_pe,
-        sparse_prompt_embeddings=sp2,
-        dense_prompt_embeddings=dn2,
-        multimask_output=False,
-    )
-
-    # --- Mode 3: Bounding Box Only ---
-    sp3, dn3 = prompt_encoder(points=None, boxes=prompts["boxes_only"], masks=None)
-    m3, iou3 = mask_decoder(
-        image_embeddings=img_emb.repeat_interleave(n_box, dim=0),
-        image_pe=dense_pe,
-        sparse_prompt_embeddings=sp3,
-        dense_prompt_embeddings=dn3,
-        multimask_output=False,
-    )
-
-    # --- Mode 4: Combined Box + Positive & Negative Refinement Points ---
-    sp4, dn4 = prompt_encoder(
-        points=(prompts["combo_pts"], prompts["combo_lbls"]),
-        boxes=prompts["combo_boxes"],
-        masks=None,
-    )
-    m4, iou4 = mask_decoder(
-        image_embeddings=img_emb.repeat_interleave(n_combo, dim=0),
-        image_pe=dense_pe,
-        sparse_prompt_embeddings=sp4,
-        dense_prompt_embeddings=dn4,
-        multimask_output=False,
-    )
-
-    # --- Mode 5: Dense Mask Prompt + Points (2nd-step interactive refinement) ---
-    mask_in = m2.detach() if coarse_mask_input is None else coarse_mask_input
-    sp5, dn5 = prompt_encoder(
-        points=(prompts["pos_neg_pts"], prompts["pos_neg_lbls"]),
-        boxes=None,
-        masks=mask_in,
-    )
-    m5, iou5 = mask_decoder(
-        image_embeddings=emb_pair,
-        image_pe=dense_pe,
-        sparse_prompt_embeddings=sp5,
-        dense_prompt_embeddings=dn5,
-        multimask_output=False,
-    )
-
-    all_masks = torch.cat([m1, m2, m3, m4, m5], dim=0)
-    all_ious = torch.cat([iou1, iou2, iou3, iou4, iou5], dim=0)
-    return all_masks, all_ious, m2.detach()
-
+    return torch.cat(masks_list, dim=0), torch.cat(ious_list, dim=0), torch.cat(coarse_list, dim=0)
 
 def train_stage2(
     image_paths: List[Path],
