@@ -76,8 +76,8 @@ def sample_comprehensive_prompts(
         bh = 64.0 + torch.rand(count, device=device) * 448.0
         x1 = (cx - bw * 0.5).clamp(0.0, img_size - 16.0)
         y1 = (cy - bh * 0.5).clamp(0.0, img_size - 16.0)
-        x2 = (cx + bw * 0.5).clamp(x1 + 16.0, float(img_size))
-        y2 = (cy + bh * 0.5).clamp(y1 + 16.0, float(img_size))
+        x2 = torch.maximum(cx + bw * 0.5, x1 + 16.0).clamp(max=float(img_size))
+        y2 = torch.maximum(cy + bh * 0.5, y1 + 16.0).clamp(max=float(img_size))
         return torch.stack([x1, y1, x2, y2], dim=-1)
 
     # 3. Standalone Boxes
