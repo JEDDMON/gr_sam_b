@@ -12,8 +12,9 @@ Features:
                              disk-backed `numpy.memmap` support, and O(1) viewport-cropped decoding.
 """
 
+import copy
 from pathlib import Path
-from typing import List, Optional, Tuple, Union, Dict, Any
+from typing import List, Optional, Tuple, Union
 
 import numpy as np
 import torch
@@ -83,19 +84,14 @@ class GrSamPredictor(SamPredictor):
         dtype: torch.dtype = torch.float16,
         memmap_dir: Optional[str] = None,
     ) -> None:
-        """
-        Args:
-            sam_model: Model built via `build_gr_sam_b()`.
-            mode: `"single_tile"`, `"multi_tile"`, or `"auto"` (triggers `multi_tile` if max(H, W) > 1024).
-            device_ids: List of GPU IDs for parallel tiling, e.g. `[0, 1, 2, 3]`. Defaults to all visible GPUs.
-            halo_patches: Border patches cropped from each side of a 64x64 tile in `multi_tile` mode.
-                          Default 16 (= 256px halo on all sides, leaving a 32x32 patch / 512x512px core).
-            dtype: Precision used during `multi_tile` encoding (`torch.float16` or `torch.bfloat16`).
-            memmap_dir: Optional directory to store stitched gigapixel embeddings on NVMe disk instead of RAM.
-        """
-        super().__init__(sam_model)
         assert mode in ("single_tile", "multi_tile", "auto"), "mode must be 'single_tile', 'multi_tile', or 'auto'"
         assert 0 <= halo_patches < 32, "halo_patches must be in [0, 31] so core_patches = (64 - 2*halo) > 0"
+
+        # Pre-initialize multi-tile attributes BEFORE super().__init__() calls self.reset_image()
+        self.global_features: Optional[Union[np.ndarray, torch.Tensor]] = None
+        self.padded_hw: Optional[Tuple[int, int]] = None
+        self.grid_patches_hw: Optional[Tuple[int, int]] = None
+        self._mmap_path: Optional[Path] = None
 
         self.default_mode = mode
         self.active_mode = mode
@@ -103,6 +99,8 @@ class GrSamPredictor(SamPredictor):
         self.core_patches = 64 - 2 * halo_patches  # 32 patches = 512px when halo_patches=16
         self.tile_dtype = dtype
         self.memmap_dir = Path(memmap_dir) if memmap_dir else None
+
+        super().__init__(sam_model)
 
         if device_ids is None:
             if torch.cuda.is_available() and self.device.type == "cuda":
@@ -115,34 +113,51 @@ class GrSamPredictor(SamPredictor):
         # Lazy-initialized multi-GPU encoder replicas & CUDA streams
         self._encoder_replicas: List[nn.Module] = []
         self._cuda_streams: List[torch.cuda.Stream] = []
-
-        # Multi-tile state
-        self.global_features: Optional[Union[np.ndarray, torch.Tensor]] = None
-        self.padded_hw: Optional[Tuple[int, int]] = None
-        self.grid_patches_hw: Optional[Tuple[int, int]] = None
-        self._mmap_path: Optional[Path] = None
-
     def _init_multigpu_replicas(self) -> None:
         """Replicates the Gr-SAM-B image encoder across `self.device_ids` once."""
         if self._encoder_replicas:
             return
 
+        base_dtype = next(self.model.image_encoder.parameters()).dtype
+
         if not self.device_ids:
             # Single CPU or default device fallback
-            enc = self.model.image_encoder.to(device=self.device, dtype=self.tile_dtype).eval()
+            if self.tile_dtype != base_dtype:
+                enc = copy.deepcopy(self.model.image_encoder).to(device=self.device, dtype=self.tile_dtype).eval()
+            else:
+                enc = self.model.image_encoder.to(device=self.device).eval()
             self._encoder_replicas = [enc]
             self._cuda_streams = []
             return
 
         for idx, dev_id in enumerate(self.device_ids):
             dev = f"cuda:{dev_id}"
-            if idx == 0 and str(self.device) == dev:
-                rep = self.model.image_encoder.to(device=dev, dtype=self.tile_dtype).eval()
+            if idx == 0 and str(self.device) == dev and self.tile_dtype == base_dtype:
+                rep = self.model.image_encoder.to(device=dev).eval()
             else:
-                import copy
                 rep = copy.deepcopy(self.model.image_encoder).to(device=dev, dtype=self.tile_dtype).eval()
             self._encoder_replicas.append(rep)
             self._cuda_streams.append(torch.cuda.Stream(device=dev))
+    # def _init_multigpu_replicas(self) -> None:
+    #     """Replicates the Gr-SAM-B image encoder across `self.device_ids` once."""
+    #     if self._encoder_replicas:
+    #         return
+
+    #     if not self.device_ids:
+    #         # Single CPU or default device fallback
+    #         enc = self.model.image_encoder.to(device=self.device, dtype=self.tile_dtype).eval()
+    #         self._encoder_replicas = [enc]
+    #         self._cuda_streams = []
+    #         return
+
+    #     for idx, dev_id in enumerate(self.device_ids):
+    #         dev = f"cuda:{dev_id}"
+    #         if idx == 0 and str(self.device) == dev:
+    #             rep = self.model.image_encoder.to(device=dev, dtype=self.tile_dtype).eval()
+    #         else:
+    #             rep = copy.deepcopy(self.model.image_encoder).to(device=dev, dtype=self.tile_dtype).eval()
+    #         self._encoder_replicas.append(rep)
+    #         self._cuda_streams.append(torch.cuda.Stream(device=dev))
 
     def set_image(
         self,
@@ -193,7 +208,6 @@ class GrSamPredictor(SamPredictor):
         self.grid_patches_hw = (total_py, total_px)
 
         # Allocate stitched feature buffer: (256, total_py, total_px) in FP16
-        # Uses disk-backed numpy.memmap if memmap_dir is set or if feature map > 2 GB
         feat_bytes = 256 * total_py * total_px * 2
         if self.memmap_dir is not None or feat_bytes > 2 * (1024 ** 3):
             mmap_dir = self.memmap_dir if self.memmap_dir is not None else Path("./tmp_grsam_mmap")
@@ -295,14 +309,6 @@ class GrSamPredictor(SamPredictor):
         Tuple[np.ndarray, np.ndarray, np.ndarray],
         Tuple[np.ndarray, np.ndarray, np.ndarray, Tuple[int, int, int, int]],
     ]:
-        """
-        Standard SAM `.predict()` interface.
-        - In `single_tile` mode: runs standard `SamPredictor.predict()`.
-        - In `multi_tile` mode: slices the local 64x64 (1024x1024px) feature viewport centered
-          around the prompt, runs the lightweight SAM MaskDecoder in O(1) VRAM, and maps the
-          resulting mask back to global image coordinates (or returns the 1024x1024 viewport crop
-          + `(y0, x0, y1, x1)` offset if `return_viewport_only=True`).
-        """
         if not self.is_image_set:
             raise RuntimeError("An image must be set with .set_image(...) before mask prediction.")
 
@@ -337,10 +343,6 @@ class GrSamPredictor(SamPredictor):
         return_logits: bool = False,
         return_viewport_only: bool = False,
     ):
-        """
-        Extracts a 64x64 patch (1024x1024 px) feature window centered on the prompt's centroid
-        from `self.global_features` and decodes masks with O(1) VRAM.
-        """
         total_py, total_px = self.grid_patches_hw
         orig_h, orig_w = self.original_size
 
@@ -368,7 +370,7 @@ class GrSamPredictor(SamPredictor):
         vp_y1 = min(vp_y0 + 1024, orig_h)
         vp_x1 = min(vp_x0 + 1024, orig_w)
 
-        # 3. Slice only the (1, 256, 64, 64) window into GPU VRAM
+        # 3. Slice only the (1, 256, 64, 64) window into device memory
         vp_feat_np = np.array(
             self.global_features[:, vp_py0 : vp_py0 + 64, vp_px0 : vp_px0 + 64],
             dtype=np.float32,
@@ -434,7 +436,6 @@ class GrSamPredictor(SamPredictor):
         ious_np = iou_predictions[0].cpu().numpy()
         low_res_np = low_res_masks[0].cpu().numpy()
 
-        # For extreme gigapixel scans where allocating a full (C, H, W) mask array in RAM is unwanted
         if return_viewport_only:
             return vp_masks_np, ious_np, low_res_np, (vp_y0, vp_x0, vp_y1, vp_x1)
 
@@ -451,9 +452,10 @@ class GrSamPredictor(SamPredictor):
         self.global_features = None
         self.padded_hw = None
         self.grid_patches_hw = None
-        if self._mmap_path is not None and self._mmap_path.exists():
+        mmap_path = getattr(self, "_mmap_path", None)
+        if mmap_path is not None and mmap_path.exists():
             try:
-                self._mmap_path.unlink()
+                mmap_path.unlink()
             except OSError:
                 pass
-            self._mmap_path = None
+        self._mmap_path = None

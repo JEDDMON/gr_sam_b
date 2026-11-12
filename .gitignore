@@ -3,3 +3,5 @@ checkpoints_gr_sam/
 __pycache__/
 data/
 checkpoints_gr_sam_S1_COPY/
+giga-pic/
+server/
