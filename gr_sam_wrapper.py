@@ -234,51 +234,73 @@ class GrSamPredictor(SamPredictor):
                 tiles.append((py0, py1, px0, px1))
 
         # Pixel normalization constants on CPU for fast tile preparation
-        mean_np = np.array([123.675, 116.28, 103.53], dtype=np.float32).reshape(1, 1, 3)
-        std_np = np.array([58.395, 57.12, 57.375], dtype=np.float32).reshape(1, 1, 3)
-
+        mean_t = torch.tensor([123.675, 116.28, 103.53]).view(1, 3, 1, 1)
+        std_t = torch.tensor([58.395, 57.12, 57.375]).view(1, 3, 1, 1)
+        
+        dev_means = {}
+        dev_stds = {}
+        for rep in self._encoder_replicas:
+            dev = str(next(rep.parameters()).device)
+            if dev not in dev_means:
+                dev_means[dev] = mean_t.to(device=dev)
+                dev_stds[dev] = std_t.to(device=dev)
+        # Execute tiles in parallel multi-GPU waves
         # Execute tiles in parallel multi-GPU waves
         for wave_start in range(0, len(tiles), num_workers):
             wave = tiles[wave_start : wave_start + num_workers]
             gpu_jobs = []
 
             for w_idx, (py0, py1, px0, px1) in enumerate(wave):
+                
                 rep = self._encoder_replicas[w_idx]
                 dev = next(rep.parameters()).device
                 stream = self._cuda_streams[w_idx] if self._cuda_streams else None
 
-                # Center a 64x64 patch (1024x1024 px) window around the core, clamped to valid canvas bounds
                 wy0 = max(0, min(py0 - halo, total_py - 64))
                 wx0 = max(0, min(px0 - halo, total_px - 64))
-
                 y_px0, y_px1 = wy0 * 16, (wy0 + 64) * 16
                 x_px0, x_px1 = wx0 * 16, (wx0 + 64) * 16
-
-                # Extract raw pixel slice, zero-padding bottom/right if the image edge is < padded boundary
+                
+                # Extract raw pixel slice as uint8 (DO NOT cast to float32 yet)
                 valid_y1 = min(y_px1, orig_h)
                 valid_x1 = min(x_px1, orig_w)
-                raw_crop = np.asarray(image[y_px0:valid_y1, x_px0:valid_x1, :], dtype=np.float32)
-                norm_crop = (raw_crop - mean_np) / std_np
+                raw_crop = image[y_px0:valid_y1, x_px0:valid_x1, :]
 
-                if norm_crop.shape[0] < 1024 or norm_crop.shape[1] < 1024:
-                    tile_hwc = np.zeros((1024, 1024, 3), dtype=np.float32)
-                    tile_hwc[: norm_crop.shape[0], : norm_crop.shape[1], :] = norm_crop
+                # Zero-pad on CPU as uint8 (extremely fast)
+                if raw_crop.shape[0] < 1024 or raw_crop.shape[1] < 1024:
+                    tile_hwc = np.zeros((1024, 1024, 3), dtype=np.uint8)
+                    tile_hwc[: raw_crop.shape[0], : raw_crop.shape[1], :] = raw_crop
                 else:
-                    tile_hwc = norm_crop
+                    tile_hwc = raw_crop
 
-                # Convert (1024, 1024, 3) -> (1, 3, 1024, 1024)
-                tile_chw = np.ascontiguousarray(tile_hwc.transpose(2, 0, 1))
+                # Convert (H, W, C) -> (C, H, W). 
+                # Added .copy() to prevent PyTorch "non-writable tensor" warnings
+                tile_chw = np.ascontiguousarray(tile_hwc.transpose(2, 0, 1)).copy()
 
+                # Wrap in pinned memory for asynchronous PCIe transfer
+                t_cpu = torch.from_numpy(tile_chw).unsqueeze(0).pin_memory()
+
+                dev_str = str(dev)
                 if stream is not None:
                     with torch.cuda.stream(stream):
-                        t_gpu = torch.from_numpy(tile_chw).unsqueeze(0).to(device=dev, dtype=self.tile_dtype, non_blocking=True)
-                        emb_64 = rep(t_gpu)  # (1, 256, 64, 64)
+                        # 1. Transfer as uint8 (75% less bandwidth)
+                        t_gpu = t_cpu.to(device=dev, non_blocking=True)
+                        
+                        # 2. Cast to float and normalize directly on the GPU
+                        t_gpu = (t_gpu.float() - dev_means[dev_str]) / dev_stds[dev_str]
+                        t_gpu = t_gpu.to(self.tile_dtype)
+                        
+                        # 3. Execute model
+                        emb_64 = rep(t_gpu) 
                         ry0, ry1 = py0 - wy0, py1 - wy0
                         rx0, rx1 = px0 - wx0, px1 - wx0
                         cropped_core = emb_64[0, :, ry0:ry1, rx0:rx1]
                         gpu_jobs.append((w_idx, py0, py1, px0, px1, cropped_core))
                 else:
-                    t_gpu = torch.from_numpy(tile_chw).unsqueeze(0).to(device=dev, dtype=self.tile_dtype)
+                    t_gpu = t_cpu.to(device=dev)
+                    t_gpu = (t_gpu.float() - dev_means[dev_str]) / dev_stds[dev_str]
+                    t_gpu = t_gpu.to(self.tile_dtype)
+                    
                     emb_64 = rep(t_gpu)
                     ry0, ry1 = py0 - wy0, py1 - wy0
                     rx0, rx1 = px0 - wx0, px1 - wx0
@@ -290,7 +312,6 @@ class GrSamPredictor(SamPredictor):
                 if self._cuda_streams:
                     self._cuda_streams[w_idx].synchronize()
                 self.global_features[:, py0:py1, px0:px1] = cropped_core.to(torch.float16).cpu().numpy()
-
         if isinstance(self.global_features, np.memmap):
             self.global_features.flush()
 
